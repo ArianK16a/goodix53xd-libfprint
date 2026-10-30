@@ -179,7 +179,10 @@ struct _FpiDeviceGoodix53xd
   double             calibration_level;
   guint              calibration_tries;
 
+  FpiSsm            *scan_ssm;
   gboolean           await_finger_off;
+  gboolean           suspending;
+  gboolean           suspended;
 
   /* Finger detection */
   gboolean           fdt_usable;
@@ -187,6 +190,7 @@ struct _FpiDeviceGoodix53xd
   Goodix53xdCmd      fdt_cmd;
   gboolean           fdt_event;
   GError            *fdt_error;
+  GCancellable      *fdt_cancellable;
   guint              landing_polls;
 
   /* Matching */
@@ -644,6 +648,8 @@ fdt_wait_cb (FpiUsbTransfer *transfer, FpDevice *dev, gpointer user_data,
 {
   FpiDeviceGoodix53xd *self = FPI_DEVICE_GOODIX53XD (dev);
 
+  g_clear_object (&self->fdt_cancellable);
+
   if (!error)
     {
       g_byte_array_set_size (self->rx, 0);
@@ -658,8 +664,10 @@ fdt_wait_cb (FpiUsbTransfer *transfer, FpDevice *dev, gpointer user_data,
       self->fdt_error = error;
     }
   else if (g_error_matches (error, G_USB_DEVICE_ERROR,
-                            G_USB_DEVICE_ERROR_TIMED_OUT))
+                                 G_USB_DEVICE_ERROR_TIMED_OUT) ||
+           g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
     {
+      /* Timeout, or interrupted for suspend */
       g_error_free (error);
     }
   else
@@ -711,13 +719,23 @@ fdt_run_state (FpiSsm *ssm, FpDevice *dev)
       break;
 
     case FDT_WAIT:
+      if (self->suspending ||
+          g_cancellable_set_error_if_cancelled (fpi_device_get_cancellable (dev),
+                                                &self->fdt_error))
+        {
+          fpi_ssm_jump_to_state (ssm, FDT_DISARM);
+          return;
+        }
+      /* Own cancellable, so that suspend can end the wait without
+       * cancelling the action; dev_cancel() cancels it too. */
+      self->fdt_cancellable = g_cancellable_new ();
       transfer = fpi_usb_transfer_new (dev);
       fpi_usb_transfer_fill_bulk (transfer, GOODIX53XD_EP_IN,
                                   GOODIX53XD_PACKET_SIZE);
       transfer->ssm = ssm;
       fpi_usb_transfer_submit (transfer,
                                down ? FDT_DOWN_TIMEOUT : FDT_UP_TIMEOUT,
-                               fpi_device_get_cancellable (dev),
+                               self->fdt_cancellable,
                                fdt_wait_cb, NULL);
       break;
 
@@ -1308,6 +1326,15 @@ scan_run_state (FpiSsm *ssm, FpDevice *dev)
           fpi_ssm_mark_failed (ssm, error);
           return;
         }
+      /* All waits return here, so this is where the scan parks during
+       * system suspend; dev_resume() re-enters this state. */
+      if (self->suspending)
+        {
+          fp_dbg ("Suspended");
+          self->suspended = TRUE;
+          fpi_device_suspend_complete (dev, NULL);
+          return;
+        }
       start_capture (ssm, dev, &mode_detect);
       break;
 
@@ -1427,7 +1454,10 @@ static void
 scan_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
 {
   FpiDeviceGoodix53xd *self = FPI_DEVICE_GOODIX53XD (dev);
+  gboolean suspending = self->suspending;
 
+  self->scan_ssm = NULL;
+  self->suspending = FALSE;
   g_clear_pointer (&self->gallery, g_ptr_array_unref);
   g_clear_pointer (&self->templates, g_ptr_array_unref);
 
@@ -1455,6 +1485,10 @@ scan_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
     case FPI_DEVICE_ACTION_CLEAR_STORAGE:
       g_assert_not_reached ();
     }
+
+  /* The action ended before reaching the point where it parks */
+  if (suspending)
+    fpi_device_suspend_complete (dev, NULL);
 }
 
 static void
@@ -1462,8 +1496,8 @@ scan_start (FpiDeviceGoodix53xd *self)
 {
   /* A finger still resting on the sensor must be lifted first */
   self->await_finger_off = TRUE;
-  fpi_ssm_start (fpi_ssm_new (FP_DEVICE (self), scan_run_state, SCAN_NUM_STATES),
-                 scan_complete);
+  self->scan_ssm = fpi_ssm_new (FP_DEVICE (self), scan_run_state, SCAN_NUM_STATES);
+  fpi_ssm_start (self->scan_ssm, scan_complete);
 }
 
 /* ------------------------------------------------------------------------ */
@@ -1580,6 +1614,50 @@ dev_match (FpDevice *dev)
   scan_start (self);
 }
 
+static void
+dev_cancel (FpDevice *dev)
+{
+  FpiDeviceGoodix53xd *self = FPI_DEVICE_GOODIX53XD (dev);
+
+  if (self->fdt_cancellable)
+    g_cancellable_cancel (self->fdt_cancellable);
+}
+
+/* Suspend keeps the action running: libfprint refuses to close a suspended
+ * device, so a cancelled action would leave it open. The scan ends its
+ * finger wait, disarms the sensor and parks until resume. */
+static void
+dev_suspend (FpDevice *dev)
+{
+  FpiDeviceGoodix53xd *self = FPI_DEVICE_GOODIX53XD (dev);
+
+  /* The scan has already finished, the action only waits to complete */
+  if (!self->scan_ssm)
+    {
+      fpi_device_suspend_complete (dev, NULL);
+      return;
+    }
+
+  self->suspending = TRUE;
+  if (self->fdt_cancellable)
+    g_cancellable_cancel (self->fdt_cancellable);
+}
+
+static void
+dev_resume (FpDevice *dev)
+{
+  FpiDeviceGoodix53xd *self = FPI_DEVICE_GOODIX53XD (dev);
+  gboolean parked = self->suspended;
+
+  self->suspending = FALSE;
+  self->suspended = FALSE;
+  fpi_device_resume_complete (dev, NULL);
+
+  /* Check for a finger and re-arm the detection */
+  if (parked)
+    fpi_ssm_jump_to_state (self->scan_ssm, SCAN_DETECT);
+}
+
 static const FpIdEntry id_table[] = {
   { .vid = 0x27c6, .pid = 0x532d, },
   { .vid = 0,      .pid = 0,      },
@@ -1610,6 +1688,7 @@ fpi_device_goodix53xd_finalize (GObject *object)
   g_clear_pointer (&self->gallery, g_ptr_array_unref);
   g_clear_pointer (&self->templates, g_ptr_array_unref);
   g_clear_error (&self->fdt_error);
+  g_clear_object (&self->fdt_cancellable);
 
   G_OBJECT_CLASS (fpi_device_goodix53xd_parent_class)->finalize (object);
 }
@@ -1637,6 +1716,9 @@ fpi_device_goodix53xd_class_init (FpiDeviceGoodix53xdClass *klass)
   dev_class->enroll = dev_enroll;
   dev_class->verify = dev_match;
   dev_class->identify = dev_match;
+  dev_class->cancel = dev_cancel;
+  dev_class->suspend = dev_suspend;
+  dev_class->resume = dev_resume;
 
   fpi_device_class_auto_initialize_features (dev_class);
 }
