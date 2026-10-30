@@ -1,0 +1,97 @@
+diff --git a/libfprint/fprint-list-udev-hwdb.c b/libfprint/fprint-list-udev-hwdb.c
+index 539f3e69..95eaca5a 100644
+--- a/libfprint/fprint-list-udev-hwdb.c
++++ b/libfprint/fprint-list-udev-hwdb.c
+@@ -165,7 +165,6 @@ static const FpIdEntry allowlist_id_table[] = {
+   { .vid = 0x27c6, .pid = 0x521d },
+   { .vid = 0x27c6, .pid = 0x5301 },
+   { .vid = 0x27c6, .pid = 0x530c },
+-  { .vid = 0x27c6, .pid = 0x532d },
+   { .vid = 0x27c6, .pid = 0x5335 },
+   { .vid = 0x27c6, .pid = 0x533c },
+   { .vid = 0x27c6, .pid = 0x5381 },
+diff --git a/libfprint/meson.build b/libfprint/meson.build
+index f11533ca..6aa38a64 100644
+--- a/libfprint/meson.build
++++ b/libfprint/meson.build
+@@ -130,6 +130,56 @@ driver_sources = {
+         'drivers/synaptics/synaptics.c',
+         'drivers/synaptics/bmkt_message.c',
+     ),
++    'goodix53xd' : files(
++        'drivers/goodix53xd/goodix53xd.c',
++        'drivers/goodix53xd/goodix53xd_proto.c',
++        'drivers/goodix53xd/goodix53xd_tls.c',
++        'drivers/goodix53xd/goodix53xd_milan.c',
++        'drivers/goodix53xd/milan/antifake/classifier.c',
++        'drivers/goodix53xd/milan/antifake/construction.c',
++        'drivers/goodix53xd/milan/antifake/feature.c',
++        'drivers/goodix53xd/milan/antifake/mask.c',
++        'drivers/goodix53xd/milan/antifake/morphology.c',
++        'drivers/goodix53xd/milan/antifake/pair.c',
++        'drivers/goodix53xd/milan/antifake/signal.c',
++        'drivers/goodix53xd/milan/core.c',
++        'drivers/goodix53xd/milan/debug-hooks.c',
++        'drivers/goodix53xd/milan/enrollment/propagation.c',
++        'drivers/goodix53xd/milan/enrollment/template.c',
++        'drivers/goodix53xd/milan/feature/enhancement.c',
++        'drivers/goodix53xd/milan/feature/extraction.c',
++        'drivers/goodix53xd/milan/feature/extrema.c',
++        'drivers/goodix53xd/milan/feature/mask.c',
++        'drivers/goodix53xd/milan/feature/materialization.c',
++        'drivers/goodix53xd/milan/feature/record.c',
++        'drivers/goodix53xd/milan/match/admission.c',
++        'drivers/goodix53xd/milan/match/candidate.c',
++        'drivers/goodix53xd/milan/match/correspondence.c',
++        'drivers/goodix53xd/milan/match/fallback.c',
++        'drivers/goodix53xd/milan/match/geometry.c',
++        'drivers/goodix53xd/milan/match/info.c',
++        'drivers/goodix53xd/milan/match/lifecycle.c',
++        'drivers/goodix53xd/milan/match/match.c',
++        'drivers/goodix53xd/milan/match/overlap.c',
++        'drivers/goodix53xd/milan/match/policy.c',
++        'drivers/goodix53xd/milan/match/rescue.c',
++        'drivers/goodix53xd/milan/match/score.c',
++        'drivers/goodix53xd/milan/match/selection.c',
++        'drivers/goodix53xd/milan/match/study.c',
++        'drivers/goodix53xd/milan/preprocess/classification.c',
++        'drivers/goodix53xd/milan/preprocess/gain.c',
++        'drivers/goodix53xd/milan/preprocess/selection.c',
++        'drivers/goodix53xd/milan/preprocess/validity.c',
++        'drivers/goodix53xd/milan/print.c',
++        'drivers/goodix53xd/milan/relations.c',
++        'drivers/goodix53xd/milan/runtime.c',
++        'drivers/goodix53xd/milan/study/policy.c',
++        'drivers/goodix53xd/milan/study/queue.c',
++        'drivers/goodix53xd/milan/study/study.c',
++        'drivers/goodix53xd/milan/template/codec.c',
++        'drivers/goodix53xd/milan/template/lifecycle.c',
++        'drivers/goodix53xd/milan/transform.c',
++    ),
+     'goodixmoc' : files(
+         'drivers/goodixmoc/goodix.c',
+         'drivers/goodixmoc/goodix_proto.c',
+@@ -153,6 +203,11 @@ helper_sources = {
+ 
+ drivers_sources = []
+ drivers_cflags = []
++if 'goodix53xd' in drivers
++    # Milan includes its headers as "milan/..."
++    drivers_cflags += [ '-I' + meson.current_source_dir() / 'drivers' / 'goodix53xd' ]
++    optional_deps += dependency('libdeflate')
++endif
+ foreach driver: drivers
+     drivers_sources += driver_sources[driver]
+ endforeach
+diff --git a/meson.build b/meson.build
+index ab09dc1d..26ebf616 100644
+--- a/meson.build
++++ b/meson.build
+@@ -141,6 +141,7 @@ drivers_info = {
+     'upeksonly': {},
+     'upekts': {},
+     'goodixmoc': {},
++    'goodix53xd': { 'helper': ['openssl'] },
+     'nb1010': {},
+     'fpcmoc': {},
+     'realtek': {},
