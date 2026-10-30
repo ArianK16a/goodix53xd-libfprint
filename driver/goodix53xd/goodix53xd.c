@@ -31,9 +31,11 @@
  * with goodix-fp-dump's run_532d.py). The driver refuses to touch sensors
  * that are not provisioned and never writes firmware or keys itself.
  *
- * The hardware finger detection (FDT) does not produce usable readings with
- * the known configuration, so finger presence is detected by polling cheap
- * frames instead: a finger pulls the calibration-mode frame towards zero.
+ * Finger presence comes from the sensor's finger detection (FDT): it reports
+ * a reading per area, and once armed with thresholds derived from the empty
+ * sensor it sends an event when a finger lands or lifts. Detect-mode frames,
+ * which a finger pulls towards zero, confirm the finger before a capture. If
+ * the FDT readings are unusable, the driver polls those frames instead.
  *
  * The images are far too small for minutiae matching. Matching is done by
  * Milan, the algorithm of the vendor driver (see goodix53xd_milan.c), so this
@@ -93,6 +95,22 @@ static const guint8 fdt_idle_mode[] = {
   0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
   0x00, 0x00, 0x00,
 };
+
+/* FDT mode blocks are [op, 0x01, 4x u16 DAC, 8x u16 threshold, reply flag].
+ * A reading reply is [irq u16][touch u16][8x u16 area readings]. */
+#define FDT_OP_MANUAL     0x0d
+#define FDT_OP_DOWN       0x0c
+#define FDT_OP_UP         0x0e
+#define FDT_BASE_OFFSET   10
+#define FDT_AREAS         8
+#define FDT_READING_LEN   (4 + 2 * FDT_AREAS)
+
+/* Finger-down is only a wake-up: the finger is still landing when it fires,
+ * so detect frames confirm the coverage before capturing. */
+#define FDT_DOWN_TIMEOUT  20000
+#define FDT_UP_TIMEOUT    1000
+#define LANDING_POLL_MS   50
+#define LANDING_POLLS     10
 
 /* Sensor register 0x022c brackets every image read (value, then value with
  * the low byte set to 0x02 afterwards). */
@@ -162,6 +180,14 @@ struct _FpiDeviceGoodix53xd
   guint              calibration_tries;
 
   gboolean           await_finger_off;
+
+  /* Finger detection */
+  gboolean           fdt_usable;
+  guint8             fdt_base[2 * FDT_AREAS];
+  Goodix53xdCmd      fdt_cmd;
+  gboolean           fdt_event;
+  GError            *fdt_error;
+  guint              landing_polls;
 
   /* Matching */
   Goodix53xdMilan                  *milan;
@@ -270,6 +296,20 @@ send_pack (FpiSsm *ssm, FpDevice *dev, GByteArray *pack)
 /* ------------------------------------------------------------------------ */
 /* Commands                                                                  */
 
+/* An FDT event can arrive just as another command is sent, for example
+ * after cancelling an FDT wait. */
+static gboolean
+is_fdt_event (FpiDeviceGoodix53xd *self)
+{
+  const guint8 *data = self->rx->data;
+
+  /* ACKs are message 0xb0 and FDT down/up have no reply message, so a
+   * 0x32/0x34 message is always an event, even while sending 0x32/0x34 */
+  return self->rx->len > 4 && data[0] == GOODIX53XD_FLAGS_MSG &&
+         (data[4] == GOODIX53XD_CMD_MCU_SWITCH_TO_FDT_DOWN ||
+          data[4] == GOODIX53XD_CMD_MCU_SWITCH_TO_FDT_UP);
+}
+
 enum cmd_states {
   CMD_SEND,
   CMD_ACK,
@@ -300,6 +340,12 @@ cmd_run_state (FpiSsm *ssm, FpDevice *dev)
       break;
 
     case CMD_CHECK_ACK:
+      if (is_fdt_event (self))
+        {
+          fp_dbg ("Skipping stray FDT event");
+          fpi_ssm_jump_to_state (ssm, CMD_ACK);
+          return;
+        }
       if (!goodix53xd_decode_msg (self->rx->data, self->rx->len,
                                   GOODIX53XD_CMD_ACK, &payload, &len, &error) ||
           !goodix53xd_check_ack (payload, len, self->cmd, &error))
@@ -315,6 +361,12 @@ cmd_run_state (FpiSsm *ssm, FpDevice *dev)
       break;
 
     case CMD_CHECK_REPLY:
+      if (is_fdt_event (self))
+        {
+          fp_dbg ("Skipping stray FDT event");
+          fpi_ssm_jump_to_state (ssm, CMD_REPLY);
+          return;
+        }
       if (self->reply_kind == REPLY_MSG)
         {
           if (!goodix53xd_decode_msg (self->rx->data, self->rx->len, self->cmd,
@@ -523,6 +575,194 @@ start_capture (FpiSsm *parent, FpDevice *dev, const CaptureMode *mode)
 }
 
 /* ------------------------------------------------------------------------ */
+/* Finger detection                                                          */
+
+/* Thresholds are the empty-sensor readings halved, written to both bytes.
+ * @refresh rejects readings well below the current thresholds, which mean a
+ * finger is still on the sensor. */
+static gboolean
+update_fdt_base (FpiDeviceGoodix53xd *self, const guint8 *reading, gsize len,
+                 gboolean refresh)
+{
+  guint8 base[2 * FDT_AREAS];
+
+  if (len < FDT_READING_LEN)
+    return FALSE;
+
+  for (gsize i = 0; i < FDT_AREAS; i++)
+    {
+      guint16 value = FP_READ_UINT16_LE (reading + 4 + 2 * i) >> 1;
+
+      if (value == 0 || value > 0xff ||
+          (refresh && value < self->fdt_base[2 * i] * 3 / 4))
+        return FALSE;
+      base[2 * i] = base[2 * i + 1] = value;
+    }
+
+  memcpy (self->fdt_base, base, sizeof (base));
+  return TRUE;
+}
+
+static void
+send_fdt (FpiSsm *ssm, FpDevice *dev, Goodix53xdCmd cmd, guint8 op,
+          gboolean reply)
+{
+  FpiDeviceGoodix53xd *self = FPI_DEVICE_GOODIX53XD (dev);
+  guint8 mode[sizeof (fdt_idle_mode)];
+
+  memcpy (mode, fdt_idle_mode, sizeof (mode));
+  mode[0] = op;
+  memcpy (mode + FDT_BASE_OFFSET, self->fdt_base, sizeof (self->fdt_base));
+  mode[sizeof (mode) - 1] = reply;
+
+  /* Arming only acknowledges; the event follows when the finger moves */
+  send_cmd (ssm, dev, cmd, mode, sizeof (mode),
+            cmd == GOODIX53XD_CMD_MCU_SWITCH_TO_FDT_MODE && reply ?
+            REPLY_MSG : REPLY_NONE);
+}
+
+/* Every FDT mode is sent twice: first without the reply flag, which clears a
+ * pending interrupt or a pending wait, then with it. Otherwise an arm fires
+ * at once, and a reading requested while armed never arrives. */
+enum fdt_states {
+  FDT_REFRESH_CLEAR,
+  FDT_REFRESH,
+  FDT_CHECK_REFRESH,
+  FDT_CLEAR,
+  FDT_ARM,
+  FDT_WAIT,
+  FDT_CHECK_EVENT,
+  FDT_DISARM,
+  FDT_DISARM_READ,
+  FDT_DISARMED,
+  FDT_NUM_STATES,
+};
+
+static void
+fdt_wait_cb (FpiUsbTransfer *transfer, FpDevice *dev, gpointer user_data,
+             GError *error)
+{
+  FpiDeviceGoodix53xd *self = FPI_DEVICE_GOODIX53XD (dev);
+
+  if (!error)
+    {
+      g_byte_array_set_size (self->rx, 0);
+      g_byte_array_append (self->rx, transfer->buffer, transfer->actual_length);
+      fpi_ssm_next_state (transfer->ssm);
+      return;
+    }
+
+  if (g_cancellable_is_cancelled (fpi_device_get_cancellable (dev)))
+    {
+      g_clear_error (&self->fdt_error);
+      self->fdt_error = error;
+    }
+  else if (g_error_matches (error, G_USB_DEVICE_ERROR,
+                            G_USB_DEVICE_ERROR_TIMED_OUT))
+    {
+      g_error_free (error);
+    }
+  else
+    {
+      fpi_ssm_mark_failed (transfer->ssm, error);
+      return;
+    }
+
+  /* The sensor stays armed until switched back to a manual reading */
+  fpi_ssm_jump_to_state (transfer->ssm, FDT_DISARM);
+}
+
+static void
+fdt_run_state (FpiSsm *ssm, FpDevice *dev)
+{
+  FpiDeviceGoodix53xd *self = FPI_DEVICE_GOODIX53XD (dev);
+  gboolean down = self->fdt_cmd == GOODIX53XD_CMD_MCU_SWITCH_TO_FDT_DOWN;
+  guint8 op = down ? FDT_OP_DOWN : FDT_OP_UP;
+  FpiUsbTransfer *transfer;
+  const guint8 *payload;
+  gsize len;
+
+  switch (fpi_ssm_get_cur_state (ssm))
+    {
+    case FDT_REFRESH_CLEAR:
+    case FDT_REFRESH:
+      /* Track drift: re-derive the thresholds while the sensor is empty */
+      if (!down)
+        {
+          fpi_ssm_jump_to_state (ssm, FDT_CLEAR);
+          return;
+        }
+      send_fdt (ssm, dev, GOODIX53XD_CMD_MCU_SWITCH_TO_FDT_MODE, FDT_OP_MANUAL,
+                fpi_ssm_get_cur_state (ssm) == FDT_REFRESH);
+      break;
+
+    case FDT_CHECK_REFRESH:
+      if (!update_fdt_base (self, self->reply, self->reply_len, TRUE))
+        fp_dbg ("Keeping FDT thresholds, reading looks covered");
+      fpi_ssm_next_state (ssm);
+      break;
+
+    case FDT_CLEAR:
+      send_fdt (ssm, dev, self->fdt_cmd, op, FALSE);
+      break;
+
+    case FDT_ARM:
+      send_fdt (ssm, dev, self->fdt_cmd, op, TRUE);
+      break;
+
+    case FDT_WAIT:
+      transfer = fpi_usb_transfer_new (dev);
+      fpi_usb_transfer_fill_bulk (transfer, GOODIX53XD_EP_IN,
+                                  GOODIX53XD_PACKET_SIZE);
+      transfer->ssm = ssm;
+      fpi_usb_transfer_submit (transfer,
+                               down ? FDT_DOWN_TIMEOUT : FDT_UP_TIMEOUT,
+                               fpi_device_get_cancellable (dev),
+                               fdt_wait_cb, NULL);
+      break;
+
+    case FDT_CHECK_EVENT:
+      if (!goodix53xd_decode_msg (self->rx->data, self->rx->len, self->fdt_cmd,
+                                  &payload, &len, NULL))
+        {
+          fp_dbg ("Ignoring unexpected message while waiting for FDT event");
+          fpi_ssm_jump_to_state (ssm, FDT_WAIT);
+          return;
+        }
+      fp_dbg ("FDT finger %s event", down ? "down" : "up");
+      self->fdt_event = TRUE;
+      /* goodix-fp-dump also returns to manual mode before capturing */
+      fpi_ssm_next_state (ssm);
+      break;
+
+    case FDT_DISARM:
+    case FDT_DISARM_READ:
+      send_fdt (ssm, dev, GOODIX53XD_CMD_MCU_SWITCH_TO_FDT_MODE, FDT_OP_MANUAL,
+                fpi_ssm_get_cur_state (ssm) == FDT_DISARM_READ);
+      break;
+
+    case FDT_DISARMED:
+      if (self->fdt_error)
+        fpi_ssm_mark_failed (ssm, g_steal_pointer (&self->fdt_error));
+      else
+        fpi_ssm_mark_completed (ssm);
+      break;
+    }
+}
+
+/* Arms finger-down or finger-up detection and waits for the event or a
+ * timeout; fdt_event tells which. */
+static void
+start_fdt (FpiSsm *parent, FpDevice *dev, Goodix53xdCmd cmd)
+{
+  FpiDeviceGoodix53xd *self = FPI_DEVICE_GOODIX53XD (dev);
+
+  self->fdt_cmd = cmd;
+  self->fdt_event = FALSE;
+  fpi_ssm_start_subsm (parent, fpi_ssm_new (dev, fdt_run_state, FDT_NUM_STATES));
+}
+
+/* ------------------------------------------------------------------------ */
 /* Activation                                                                */
 
 enum activate_states {
@@ -547,6 +787,7 @@ enum activate_states {
   ACTIVATE_CHECK_CONFIG,
   ACTIVATE_FDT_IDLE,
   ACTIVATE_FDT_IDLE_REPLY,
+  ACTIVATE_CHECK_FDT,
   ACTIVATE_CALIBRATE,
   ACTIVATE_CHECK_CALIBRATION,
   ACTIVATE_NUM_STATES,
@@ -813,6 +1054,14 @@ activate_run_state (FpiSsm *ssm, FpDevice *dev)
       }
       break;
 
+    case ACTIVATE_CHECK_FDT:
+      self->fdt_usable = update_fdt_base (self, self->reply, self->reply_len,
+                                          FALSE);
+      if (!self->fdt_usable)
+        fp_warn ("No usable finger detection readings, polling instead");
+      fpi_ssm_next_state (ssm);
+      break;
+
     case ACTIVATE_CALIBRATE:
       start_capture (ssm, dev, &mode_detect);
       break;
@@ -880,6 +1129,8 @@ activate_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
 enum scan_states {
   SCAN_DETECT,
   SCAN_EVALUATE,
+  SCAN_WAIT,
+  SCAN_WAIT_DONE,
   SCAN_CAPTURE,
   SCAN_PROCESS,
   SCAN_NUM_STATES,
@@ -1067,6 +1318,7 @@ scan_run_state (FpiSsm *ssm, FpDevice *dev)
         {
           fp_dbg ("Finger off");
           self->await_finger_off = FALSE;
+          self->landing_polls = 0;
           fpi_device_report_finger_status_changes (dev, FP_FINGER_STATUS_NEEDED,
                                                    FP_FINGER_STATUS_PRESENT);
         }
@@ -1075,11 +1327,33 @@ scan_run_state (FpiSsm *ssm, FpDevice *dev)
           fp_dbg ("Finger on (%.0f%% covered)", ratio * 100);
           fpi_device_report_finger_status_changes (dev, FP_FINGER_STATUS_PRESENT,
                                                    FP_FINGER_STATUS_NEEDED);
-          fpi_ssm_next_state (ssm);
+          fpi_ssm_jump_to_state (ssm, SCAN_CAPTURE);
+          return;
+        }
+      else if (!self->await_finger_off && self->landing_polls > 0)
+        {
+          /* Finger-down fired; wait for the finger to settle */
+          self->landing_polls--;
+          fpi_ssm_jump_to_state_delayed (ssm, SCAN_DETECT, LANDING_POLL_MS);
           return;
         }
 
-      fpi_ssm_jump_to_state_delayed (ssm, SCAN_DETECT, GOODIX53XD_POLL_MS);
+      if (self->fdt_usable)
+        fpi_ssm_next_state (ssm);
+      else
+        fpi_ssm_jump_to_state_delayed (ssm, SCAN_DETECT, GOODIX53XD_POLL_MS);
+      break;
+
+    case SCAN_WAIT:
+      start_fdt (ssm, dev, self->await_finger_off ?
+                 GOODIX53XD_CMD_MCU_SWITCH_TO_FDT_UP :
+                 GOODIX53XD_CMD_MCU_SWITCH_TO_FDT_DOWN);
+      break;
+
+    case SCAN_WAIT_DONE:
+      if (self->fdt_event && !self->await_finger_off)
+        self->landing_polls = LANDING_POLLS;
+      fpi_ssm_jump_to_state (ssm, SCAN_DETECT);
       break;
 
     case SCAN_CAPTURE:
@@ -1335,6 +1609,7 @@ fpi_device_goodix53xd_finalize (GObject *object)
   g_clear_pointer (&self->enroll_tx, goodix_milan_enrollment_transaction_free);
   g_clear_pointer (&self->gallery, g_ptr_array_unref);
   g_clear_pointer (&self->templates, g_ptr_array_unref);
+  g_clear_error (&self->fdt_error);
 
   G_OBJECT_CLASS (fpi_device_goodix53xd_parent_class)->finalize (object);
 }
