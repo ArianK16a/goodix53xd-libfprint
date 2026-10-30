@@ -1,0 +1,3 @@
+[submodule "external/goodix53x5-libfprint"]
+	path = external/goodix53x5-libfprint
+	url = https://github.com/nikicat/goodix53x5-libfprint.git
