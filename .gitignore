@@ -1,0 +1,7 @@
+# raw fingerprint images and test prints: biometric data
+captures/
+fptest/
+# separate git repository (libfprint fork)
+libfprint/
+__pycache__/
+milan-harness/harness
